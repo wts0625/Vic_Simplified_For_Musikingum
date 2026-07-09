@@ -1,0 +1,2 @@
+# Vic_Simplified_For_Musikingum
+基于vic模型原理
