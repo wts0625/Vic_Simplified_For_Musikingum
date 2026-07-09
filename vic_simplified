@@ -1,0 +1,334 @@
+#3月6日完成，建议后续以此版本输出数据为准
+import xarray as xr 
+import numpy as np
+import pandas as pd
+import rasterio
+from collections import deque
+import os
+import matplotlib.pyplot as plt
+import warnings
+
+warnings.filterwarnings('ignore')
+
+print("============== [阶段1] 分布式地表、土壤与河网拓扑初始化 ==============")
+
+# ---------------------------------------------------------
+# 1. 路径与核心参数
+# ---------------------------------------------------------
+path_dem  = r"G:\MyResearchData\Result_alos30\vic\dem_001de.tif"
+path_sub  = r"G:\MyResearchData\Result_alos30\vic\subbasin.tif"
+path_fdir = r"G:\MyResearchData\Result_alos30\vic\fdir_001de.tif"
+path_facc = r"G:\MyResearchData\Result_alos30\vic\facc_001de.tif"
+path_soil = r"G:\MyResearchData\Result_solidgrids\vic_soil_final.nc"
+path_veg  = r"G:\MyResearchData\Result_gclfcs30\vic_vegparam001de.nc"
+path_pr   = r"G:\MyResearchData\Result_imerg\vic_imerg001.nc"
+path_era5 = r"G:\MyResearchData\Result_era5\vic_era5_image.nc"
+out_dir   = r"G:\MyResearchData\Result_vic\\"
+if not os.path.exists(out_dir): os.makedirs(out_dir)
+
+warmup_steps = 12 * 24        
+total_steps  = 768    # 严格限定只输出这 768 个时段 (7.15-8.15)
+event_start  = 12 * 24        # 主事件期开始: 7.27 00:00
+event_end    = 21 * 24 + 23   # 主事件期结束: 8.05 23:00
+
+# VIC水文物理参数调整 (降低RC，增加基流平滑)
+B_INF_VAL  = 0.35        # 增大 b_inf，增加土壤吃水能力，降低RC
+D_S_VAL    = 0.05        
+DS_MAX     = 6.0 / 24.0  
+W_S_VAL    = 0.6         
+Q_LAT_COEF = 0.002       # 降低壤中流系数，逼迫更多水渗入深层转化为基流
+Baseflow_K_hours = 48.0  # [新增] 地下水出流演进参数 (3天退水期，极大平滑退水线)
+THICKNESS  =[0.1, 0.5, 0.5] 
+
+def clean_nodata(arr, nodata_threshold=-1e30, is_categorical=False):
+    arr_clean = np.where((arr < nodata_threshold) | (arr > 1e30), np.nan, arr)
+    if not is_categorical:
+        valid_mean = np.nanmean(arr_clean)
+        return np.where(np.isnan(arr_clean), valid_mean, arr_clean)
+    return arr_clean
+
+# ---------------------------------------------------------
+# 2. 读取基础地理与植被参数 
+# ---------------------------------------------------------
+with rasterio.open(path_dem) as src:
+    dem = clean_nodata(src.read(1))
+    mask = (dem > -100) & (~np.isnan(dem))
+    transform = src.transform
+    height, width = dem.shape
+    lats = np.array([transform * (0, i) for i in range(height)])[:, 1]
+    dx_m, dy_m = 0.01 * 110574, 0.01 * 111320
+
+grid_area = np.zeros((height, width))
+for i, lat in enumerate(lats): 
+    grid_area[i, :] = (0.01 * 111320 * np.cos(np.radians(lat))) * (0.01 * 110574)
+grid_area = np.where(mask, grid_area, 0.0)
+
+# 预先计算面积权重，用于精确核算 mm 量级的水量平衡，避免大数相加崩溃
+area_weights = grid_area[mask] / np.sum(grid_area[mask])
+
+with rasterio.open(path_sub) as src:
+    subbasin = src.read(1)
+    valid_mask = (subbasin > 0) & (subbasin != 255) & (~np.isnan(subbasin)) & mask
+    sub_ids = np.unique(subbasin[valid_mask]).astype(int)
+
+with rasterio.open(path_facc) as src:
+    facc = np.where(mask, clean_nodata(src.read(1), is_categorical=True), 0)
+    facc = np.nan_to_num(facc)
+
+ds_soil = xr.open_dataset(path_soil)
+Wmax =[]
+for i, t in enumerate(THICKNESS, 1):
+    por = ds_soil[f'porosity_layer{i}'].values
+    if por.ndim > 2: por = por[0]
+    por_clean = np.where(mask, clean_nodata(por), 0.0)
+    Wmax.append(np.where(mask, por_clean * t * 1000.0, 0.0))
+
+W1_max, W2_max, W3_max = Wmax
+W2_fc = 0.6 * W2_max
+Ks = 10.0 + 20.0 * np.clip(Wmax[0]/(THICKNESS[0]*1000 + 1e-6), 0.2, 0.6)
+
+ds_veg = xr.open_dataset(path_veg)
+veg_fraction = np.transpose(np.where(np.isnan(ds_veg['veg_fraction'].values), 0, ds_veg['veg_fraction'].values), (1, 2, 0))
+grid_LAI = np.sum(veg_fraction * clean_nodata(ds_veg['LAI'].values).reshape(1, 1, -1), axis=2)
+grid_albedo = np.where(mask, np.clip(np.sum(veg_fraction * clean_nodata(ds_veg['albedo'].values).reshape(1, 1, -1), axis=2), 0.1, 0.3), 0.23)
+grid_rough = np.where(mask, np.maximum(np.sum(veg_fraction * clean_nodata(ds_veg['roughness_length'].values).reshape(1, 1, -1), axis=2), 0.01), 0.01)
+grid_canopy_max = np.where(mask, grid_LAI * 0.2, 0.0)
+
+# ---------------------------------------------------------
+# 3. 坡面/河网双元流速与旅行时间计算 
+# ---------------------------------------------------------
+print("============== [阶段2] 分布式河网识别与等流时线追踪 ==============")
+dz_dy, dz_dx = np.gradient(np.where(mask, dem, np.nan))
+slope = np.where(mask, np.clip(np.sqrt((np.nan_to_num(dz_dx)/dx_m)**2 + (np.nan_to_num(dz_dy)/dy_m)**2), 0.0001, 1.0), 0.0001)
+
+R_hydro = np.where(facc > 50, np.clip(0.1 * np.log1p(facc), 0.2, 3.0), 0.02)
+n_manning = np.where(facc > 50, 0.035, np.clip(0.04 * (grid_rough ** (1/6.0)), 0.03, 0.15)) 
+V_grid = np.where(mask, np.clip((1.0 / n_manning) * (R_hydro**0.667) * np.sqrt(slope), 0.05, 5.0), 0.1)
+
+Grid_K_hours = np.where(mask, np.clip((1000.0 / V_grid) / 3600.0, 0.2, 1.5), 0.5)
+grid_travel_hrs = np.full((height, width), np.nan)
+with rasterio.open(path_fdir) as src: fdir = src.read(1).astype(np.int16)
+dir_to_offset = {1:(0,1), 2:(1,1), 4:(1,0), 8:(1,-1), 16:(0,-1), 32:(-1,-1), 64:(-1,0), 128:(-1,1)}
+
+for sid in sub_ids:
+    mask_sid = (subbasin == sid)
+    rows, cols = np.where(mask_sid)
+    outlets =[]
+    for r, c in zip(rows, cols):
+        d = fdir[r, c]
+        if d in dir_to_offset:
+            nr, nc = r + dir_to_offset[d][0], c + dir_to_offset[d][1]
+            if not (0 <= nr < height and 0 <= nc < width and subbasin[nr, nc] == sid): outlets.append((r, c))
+    if not outlets: outlets.append(np.unravel_index(np.argmin(np.where(mask_sid, dem, np.inf)), dem.shape))
+    
+    dist = np.full((height, width), np.nan)
+    queue = deque(outlets)
+    for r, c in outlets: dist[r, c] = 0.0
+    
+    while queue:
+        r, c = queue.popleft()
+        for d_val, (dr, dc) in dir_to_offset.items():
+            nr, nc = r - dr, c - dc
+            if 0 <= nr < height and 0 <= nc < width and mask_sid[nr, nc] and np.isnan(dist[nr, nc]) and fdir[nr, nc] == d_val:
+                dist[nr, nc] = dist[r, c] + np.sqrt((dr*dy_m)**2 + (dc*dx_m)**2)
+                queue.append((nr, nc))
+                
+    nan_mask = mask_sid & np.isnan(dist)
+    if np.any(nan_mask): 
+        dist[nan_mask] = np.sqrt(((np.where(nan_mask)[0] - outlets[0][0])*dy_m)**2 + ((np.where(nan_mask)[1] - outlets[0][1])*dx_m)**2)
+    
+    grid_travel_hrs[mask_sid] = dist[mask_sid] / (V_grid[mask_sid] * 3600.0)
+
+print("============== [阶段3] 加载气象与纯分布式 VIC 产流机制 ==============")
+ds_pr = xr.open_dataset(path_pr); pr_nc = np.where(mask, np.nan_to_num(ds_pr['Precipitation'].values[:total_steps]), 0.0)
+ds_era = xr.open_dataset(path_era5)
+T_nc  = np.where(mask, np.nan_to_num(ds_era['T'].values[:total_steps]), 20.0)
+RH_nc = np.where(mask, np.nan_to_num(ds_era['RH'].values[:total_steps]), 70.0)
+WS_nc = np.maximum(np.where(mask, np.nan_to_num(ds_era['WS'].values[:total_steps]), 1.0), 0.1)
+SP_nc = np.where(mask, np.nan_to_num(ds_era['SP'].values[:total_steps]), 1013.25)
+SW_nc = np.where(mask, np.nan_to_num(ds_era['SW'].values[:total_steps]), 0.0)
+LW_nc = np.where(mask, np.nan_to_num(ds_era['LW'].values[:total_steps]), 0.0)
+
+def calc_distributed_pet(T, RH, WS, SP, SW, LW, mask, albedo_arr, rough_arr):
+    sigma, lambda_v = 5.67e-8, 2.45
+    e_s = 0.6108 * np.exp((17.27 * T) / (T + 237.3))
+    rh_frac = RH / 100.0 if np.nanmax(RH) > 2.0 else RH
+    e_a = e_s * rh_frac
+    delta = (4098 * e_s) / ((T + 237.3)**2)
+    gamma = 0.000665 * (SP / 10.0 if np.nanmax(SP) > 2000 else SP)
+    Rn_MJ_h = (SW * (1 - albedo_arr) + LW - sigma * ((T + 273.15)**4)) * 0.0036
+    ra = np.clip((np.log(2.0 / np.maximum(rough_arr, 0.001))**2) / (0.41**2 * WS), 20, 300) 
+    pet = (delta * Rn_MJ_h + 1.2 * 1.013 * 3600 * (e_s - e_a) / ra / 1000) / (delta + gamma * (1 + 0.34 * WS)) / lambda_v
+    return np.where(mask, np.nan_to_num(np.maximum(0, pet)), 0.0)
+
+def vic_runoff_step_distributed(P, PET, state):
+    W1, W2, W3, Wc, S_store, GW_store = state['W1'], state['W2'], state['W3'], state['Wc'], state['S_store'], state['GW_store']
+    
+    Wc += P; P_net = np.maximum(0, Wc - grid_canopy_max); Wc = np.minimum(Wc, grid_canopy_max)
+    E_can = np.minimum(Wc, PET); Wc -= E_can; PET_rem = PET - E_can
+    
+    Wsurf = W1 + W2; Wsurf_max = W1_max + W2_max
+    im = (1 + B_INF_VAL) * Wsurf_max
+    A = 1 - (1 - np.clip(Wsurf / (Wsurf_max + 1e-6), 0, 0.9999))**(1/(1+B_INF_VAL))
+    i0 = im * (1 - (1 - A)**(1+B_INF_VAL))
+    
+    R_surf = np.where(P_net < im - i0, P_net - Wsurf_max + Wsurf + Wsurf_max * (1 - (i0 + P_net) / (im+1e-6))**(1+B_INF_VAL), P_net - (Wsurf_max - Wsurf))
+    R_surf = np.maximum(R_surf, 0); infil = np.maximum(P_net - R_surf, 0)
+    
+    E_W1 = np.minimum(W1, PET_rem); W1 -= E_W1; PET_rem -= E_W1
+    E_W2 = np.minimum(W2, PET_rem); W2 -= E_W2
+    
+    W1 += infil; over1 = np.maximum(0, W1 - W1_max); W1 -= over1; W2 += over1
+    excess_w2 = np.maximum(0, W2 - W2_fc)
+    Q_lat = np.minimum(Q_LAT_COEF * Ks * (excess_w2 / (W2_max + 1e-6)), W2); W2 -= Q_lat
+    
+    perc = np.minimum(0.1 * Ks * (excess_w2 / (W2_max + 1e-6)), W2); W2 -= perc; W3 += perc
+    over2 = np.maximum(0, W2 - W2_max); W2 -= over2; W3 += over2
+    
+    ratio = W3 / (W3_max + 1e-6)
+    Q_base_raw = np.where(ratio <= W_S_VAL, (D_S_VAL * DS_MAX / W_S_VAL) * ratio, D_S_VAL * DS_MAX + (DS_MAX - D_S_VAL * DS_MAX) * ((ratio - W_S_VAL) / (1 - W_S_VAL))**2.0)
+    Q_base_raw = np.minimum(Q_base_raw, W3); W3 -= Q_base_raw
+    over3 = np.maximum(0, W3 - W3_max); W3 -= over3; Q_base_raw += over3
+    
+    # 【双水库平滑演进：地表慢蓄 + 地下深蓄】
+    S_store += (R_surf + Q_lat)
+    Q_surf_routed = S_store * (1.0 - np.exp(-1.0 / Grid_K_hours))
+    S_store -= Q_surf_routed
+    
+    # [新增] 地下水出流极其平缓，增加退水阶段斜率
+    GW_store += Q_base_raw
+    Q_base_routed = GW_store * (1.0 - np.exp(-1.0 / Baseflow_K_hours))
+    GW_store -= Q_base_routed
+
+    state['W1'], state['W2'], state['W3'] = np.nan_to_num(W1), np.nan_to_num(W2), np.nan_to_num(W3)
+    state['Wc'], state['S_store'], state['GW_store'] = np.nan_to_num(Wc), np.nan_to_num(S_store), np.nan_to_num(GW_store)
+    
+    return np.nan_to_num(Q_surf_routed), np.nan_to_num(Q_base_routed), np.nan_to_num(E_can + E_W1 + E_W2), state
+
+# ==========================================
+# 4. 正确的时间轴：预热与连续事件模拟
+# ==========================================
+print("==============[阶段4] 连续时序推进与分布式等流时线汇流 ==============")
+# 初始含水量回调至 55%（解决全局RC过大问题）
+state = {'W1': 0.55*W1_max, 'W2': 0.55*W2_max, 'W3': 0.55*W3_max, 
+         'Wc': np.zeros_like(W1_max), 'S_store': np.zeros_like(W1_max), 'GW_store': np.zeros_like(W1_max)}
+
+for cycle in range(1, 6):
+    for t in range(warmup_steps):
+        PET_t = calc_distributed_pet(T_nc[t], RH_nc[t], WS_nc[t], SP_nc[t], SW_nc[t], LW_nc[t], mask, grid_albedo, grid_rough)
+        _, _, _, state = vic_runoff_step_distributed(pr_nc[t], PET_t, state)
+    print(f" -> 预热循环第 {cycle} 次完成")
+
+# 获取初始蓄水量 (mm)
+initial_storage_mm = np.sum((state['W1'] + state['W2'] + state['W3'] + state['Wc'] + state['S_store'] + state['GW_store'])[mask] * area_weights)
+
+# 仅保留严格的 768 时段！抛弃无用的退水尾巴
+subbasin_flow = {sid: np.zeros(total_steps) for sid in sub_ids}
+
+# 评价指标累加器 (分离：全期 / 主事件期)
+stats = {
+    'full': {'P': 0.0, 'E': 0.0, 'Rs': 0.0, 'Rb': 0.0},
+    'event': {'P': 0.0, 'E': 0.0, 'Rs': 0.0, 'Rb': 0.0}
+}
+sub_stats_full = {sid: {'P': 0.0, 'R': 0.0} for sid in sub_ids}
+sub_stats_event = {sid: {'P': 0.0, 'R': 0.0} for sid in sub_ids}
+
+for t in range(total_steps):
+    if t % 100 == 0: print(f"  [Time] {t}/{total_steps} (连续模拟中...)")
+    
+    PET_t = calc_distributed_pet(T_nc[t], RH_nc[t], WS_nc[t], SP_nc[t], SW_nc[t], LW_nc[t], mask, grid_albedo, grid_rough)
+    Q_surf_routed, Q_base_routed, E_total, state = vic_runoff_step_distributed(pr_nc[t], PET_t, state)
+    
+    # 严格的面积加权 mm 计算 (解决 33万 mm 的巨大误差)
+    P_mean_mm = np.sum(pr_nc[t][mask] * area_weights)
+    E_mean_mm = np.sum(E_total[mask] * area_weights)
+    Rs_mean_mm = np.sum(Q_surf_routed[mask] * area_weights)
+    Rb_mean_mm = np.sum(Q_base_routed[mask] * area_weights)
+
+    # 1. 全期统计
+    stats['full']['P'] += P_mean_mm; stats['full']['E'] += E_mean_mm
+    stats['full']['Rs'] += Rs_mean_mm; stats['full']['Rb'] += Rb_mean_mm
+
+    # 2. 主事件期统计 (7.27 - 8.5)
+    if event_start <= t <= event_end:
+        stats['event']['P'] += P_mean_mm; stats['event']['E'] += E_mean_mm
+        stats['event']['Rs'] += Rs_mean_mm; stats['event']['Rb'] += Rb_mean_mm
+
+    # 等流时线汇流
+    grid_total_m3s = (Q_surf_routed + Q_base_routed) * grid_area / 3600000.0
+    for sid in sub_ids:
+        mask_sid = (subbasin == sid)
+        if not np.any(mask_sid): continue
+        
+        # 记录子流域全期与事件期数据
+        sub_P = np.average(pr_nc[t][mask_sid])
+        sub_R = np.average((Q_surf_routed + Q_base_routed)[mask_sid])
+        sub_stats_full[sid]['P'] += sub_P; sub_stats_full[sid]['R'] += sub_R
+        if event_start <= t <= event_end:
+            sub_stats_event[sid]['P'] += sub_P; sub_stats_event[sid]['R'] += sub_R
+        
+        vols, hrs = grid_total_m3s[mask_sid], grid_travel_hrs[mask_sid]
+        T_arrival = t + hrs
+        T_int = np.floor(T_arrival).astype(int)
+        alpha = T_arrival - T_int
+        
+        # 边界截断：任何超出 total_steps (768) 的时间汇流将被丢弃 (不要尾巴)
+        valid = (T_int + 1 < total_steps) & (~np.isnan(vols))
+        if np.any(valid):
+            np.add.at(subbasin_flow[sid], T_int[valid], vols[valid] * (1 - alpha[valid]))
+            np.add.at(subbasin_flow[sid], T_int[valid] + 1, vols[valid] * alpha[valid])
+
+# ==========================================
+# 5. 模型质量综合检测与全序列输出
+# ==========================================
+print("\n==============[阶段5] 模型指标全面统计与体检 ==============")
+
+def print_metrics(title, P, E, Rs, Rb, dS=None):
+    Total_R = Rs + Rb
+    print(f"\n>>> [{title}]")
+    print(f"  累积降水 (P): {P:.2f} mm")
+    print(f"  累积蒸发 (E): {E:.2f} mm")
+    print(f"  累积产流 (R_total): {Total_R:.2f} mm (其中地表 {Rs:.2f}, 基流 {Rb:.2f})")
+    if dS is not None:
+        error = P - E - Total_R - dS
+        print(f"  蓄水变量 (ΔS): {dS:.2f} mm")
+        print(f"  水量闭合差 (Error): {error:.6f} mm (理论上应趋近于0)")
+    print(f"  径流系数 (RC): {Total_R / (P + 1e-6):.3f}")
+    print(f"  基流指数 (BFI): {Rb / (Total_R + 1e-6):.3f}")
+
+# 1. 全域水量平衡
+final_storage_mm = np.sum((state['W1'] + state['W2'] + state['W3'] + state['Wc'] + state['S_store'] + state['GW_store'])[mask] * area_weights)
+delta_S_mm = final_storage_mm - initial_storage_mm
+print_metrics("1. 全期宏观水量平衡 (7.15 - 8.15)", **stats['full'], dS=delta_S_mm)
+print_metrics("2. 主事件期水量特征 (7.27 - 8.05)", **stats['event'])
+
+# 3. 子流域空间异质性指标
+def get_sub_rcs(sub_stats_dict):
+    return {sid: v['R']/v['P'] for sid, v in sub_stats_dict.items() if v['P'] > 1.0}
+
+rcs_full = get_sub_rcs(sub_stats_full)
+rcs_event = get_sub_rcs(sub_stats_event)
+
+print("\n>>>[3. 子流域空间异质性指标]")
+print(f"  [全期] RC 平均值: {np.mean(list(rcs_full.values())):.3f}, 最大值: {np.max(list(rcs_full.values())):.3f}, 最小值: {np.min(list(rcs_full.values())):.3f}")
+print(f"  [事件期] RC 平均值: {np.mean(list(rcs_event.values())):.3f}, 最大值: {np.max(list(rcs_event.values())):.3f}, 最小值: {np.min(list(rcs_event.values())):.3f}")
+
+# 筛查异常偏大(RC>1)的流域：通常是局地降雨极少，但前期老水(基流)持续流出导致。
+over_1_sids =[sid for sid, rc in rcs_full.items() if rc > 1.0]
+if over_1_sids:
+    print(f"  [⚠️ 注意] 全期 RC > 1.0 的子流域编号: {over_1_sids}")
+    print("      (注: 在非长序列中，因区域无雨但前期基流持续排泄，会导致RC>1，属于模型水文学正常现象)")
+
+# 4. 全序列提取与截断输出
+time_index = pd.date_range(start='2023-07-15 00:00:00', periods=total_steps, freq='H')
+df_full = pd.DataFrame({f"Subbasin_{k}": v for k, v in subbasin_flow.items()}, index=time_index)
+
+max_sid_col = df_full.max().idxmax()
+print(f"\n>>>[4. 洪峰流量自查验证]")
+print(f"  全序列最猛烈子流域为: {max_sid_col}")
+print(f"  该子流域模拟最大洪峰: {df_full[max_sid_col].max():.2f} m³/s")
+
+# 彻底丢弃 8.15 之后的数据
+out_csv = os.path.join(out_dir, "Muskingum_Lateral_Inflow_Exactly_768h.csv")
+df_full.to_csv(out_csv)
+print(f"\n✅ 修正完毕！纯分布式网格汇流生成的 CSV (精确 768 小时，无尾巴) 已保存至: {out_csv}")
